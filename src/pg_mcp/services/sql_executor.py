@@ -7,14 +7,18 @@ result serialization, and row limiting to prevent memory overflow.
 import asyncio
 import datetime
 import decimal
+import time
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 from asyncpg import Connection, Pool
 
 from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
+
+if TYPE_CHECKING:
+    from pg_mcp.observability.metrics import MetricsCollector
 
 
 class SQLExecutor:
@@ -37,6 +41,7 @@ class SQLExecutor:
         pool: Pool,
         security_config: SecurityConfig,
         db_config: DatabaseConfig,
+        metrics: "MetricsCollector | None" = None,
     ) -> None:
         """Initialize SQL executor.
 
@@ -44,10 +49,12 @@ class SQLExecutor:
             pool: asyncpg connection pool for database connections.
             security_config: Security configuration including timeouts and limits.
             db_config: Database configuration including connection parameters.
+            metrics: Optional metrics collector for observing DB query latency.
         """
         self.pool = pool
         self.security_config = security_config
         self.db_config = db_config
+        self.metrics = metrics
 
     async def execute(
         self,
@@ -100,6 +107,7 @@ class SQLExecutor:
                 await self._set_session_params(connection, timeout)
 
                 # Execute query with timeout
+                start_time = time.monotonic()
                 try:
                     records = await asyncio.wait_for(
                         connection.fetch(sql),
@@ -113,6 +121,9 @@ class SQLExecutor:
                             "sql": sql[:200],  # Include truncated SQL for debugging
                         },
                     ) from e
+                finally:
+                    if self.metrics is not None:
+                        self.metrics.observe_db_query_duration(time.monotonic() - start_time)
 
                 # Track total count before limiting
                 total_count = len(records)

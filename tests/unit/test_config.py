@@ -200,24 +200,24 @@ class TestValidationConfig:
         """Test default configuration values."""
         config = ValidationConfig()
         assert config.max_question_length == 10000
-        assert config.min_confidence_score == 70
+        assert config.confidence_threshold == 70
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = ValidationConfig(
             max_question_length=5000,
-            min_confidence_score=80,
+            confidence_threshold=80,
         )
         assert config.max_question_length == 5000
-        assert config.min_confidence_score == 80
+        assert config.confidence_threshold == 80
 
-    def test_invalid_confidence_score(self) -> None:
-        """Test invalid confidence score is rejected."""
+    def test_invalid_confidence_threshold(self) -> None:
+        """Test invalid confidence threshold is rejected."""
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=-1)
+            ValidationConfig(confidence_threshold=-1)
 
         with pytest.raises(ValidationError):
-            ValidationConfig(min_confidence_score=101)
+            ValidationConfig(confidence_threshold=101)
 
 
 class TestCacheConfig:
@@ -292,7 +292,7 @@ class TestObservabilityConfig:
         # 生产环境应该通过环境变量显式设置
         assert config.metrics_port == 9090
         assert config.log_level == "INFO"
-        assert config.log_format == "json"
+        assert config.log_format == "text"
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""

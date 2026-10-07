@@ -39,7 +39,7 @@ _rate_limiter: MultiRateLimiter | None = None
 
 
 @asynccontextmanager
-async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-arg]
+async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
     """Lifespan context manager for server initialization and cleanup.
 
     This function manages the complete lifecycle of the MCP server:
@@ -149,12 +149,12 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
+        # SQL Validator (table/column access limits and EXPLAIN policy from settings)
         sql_validator = SQLValidator(
             config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
+            blocked_tables=_settings.security.blocked_tables,
+            blocked_columns=_settings.security.blocked_columns,
+            allow_explain=_settings.security.allow_explain,
         )
 
         # SQL Executor (create one per database)
@@ -164,8 +164,11 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                 pool=pool,
                 security_config=_settings.security,
                 db_config=_settings.database,
+                metrics=_metrics,
             )
             sql_executors[db_name] = executor
+            # Report connection pool headroom as a gauge for monitoring
+            _metrics.set_db_connections_active(db_name, _settings.database.max_pool_size)
             logger.info(f"Created SQL executor for database '{db_name}'")
 
         # Result Validator
@@ -183,10 +186,10 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             recovery_timeout=_settings.resilience.circuit_breaker_timeout,
         )
 
-        # Rate Limiter
+        # Rate Limiter (query and LLM concurrency from settings)
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.resilience.query_concurrency,
+            llm_limit=_settings.resilience.llm_concurrency,
         )
 
         # 8. Create QueryOrchestrator
@@ -194,12 +197,15 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
             sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_executor=sql_executors[_settings.database.name],  # Primary executor fallback
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            sql_executors=sql_executors,  # Per-database executors
+            rate_limiter=_rate_limiter,  # Enforce query/LLM concurrency limits
+            metrics=_metrics,  # Record request/LLM/security metrics
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
@@ -228,7 +234,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                     timeout=3.0
                 )
                 logger.info("Schema auto-refresh stopped")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Schema auto-refresh stop timed out")
             except Exception as e:
                 logger.warning(f"Error stopping schema auto-refresh: {e!s}")
@@ -306,8 +312,10 @@ async def query(
         returned in the response with success=False and error details.
 
     Security:
-        - Only SELECT queries are allowed (no INSERT, UPDATE, DELETE, DROP, etc.)
+        - Only SELECT queries are allowed (DML gated by SECURITY_ALLOW_WRITE_OPERATIONS)
         - Dangerous PostgreSQL functions are blocked (pg_sleep, file operations, etc.)
+        - Access to blocked tables/columns is rejected (SECURITY_BLOCKED_TABLES/COLUMNS)
+        - EXPLAIN is denied unless SECURITY_ALLOW_EXPLAIN is enabled
         - Query execution timeout is enforced
         - Row count limits prevent memory exhaustion
         - All queries run in read-only transactions

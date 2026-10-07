@@ -98,11 +98,28 @@ class SecurityConfig(BaseSettings):
     safe_search_path: str = Field(
         default="public", description="Safe search_path to set during query execution"
     )
+    blocked_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List of table names (bare or schema.table) that queries are not allowed to access. "
+            "Sensitive objects are protected from being read."
+        ),
+    )
+    blocked_columns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List of column names (bare or table.column) that queries are not allowed to select. "
+            "Sensitive columns are protected from being read."
+        ),
+    )
+    allow_explain: bool = Field(
+        default=False, description="Whether to allow EXPLAIN statements (read-only query plans)"
+    )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
-        """Parse comma-separated string or list."""
+    def parse_list_fields(cls, v: str | list[str]) -> list[str]:
+        """Parse comma-separated string or list for any list-typed security field."""
         if isinstance(v, str):
             return [f.strip() for f in v.split(",") if f.strip()]
         return v
@@ -115,9 +132,6 @@ class ValidationConfig(BaseSettings):
 
     max_question_length: int = Field(
         default=10000, ge=1, le=50000, description="Maximum question length in characters"
-    )
-    min_confidence_score: int = Field(
-        default=70, ge=0, le=100, description="Minimum confidence score (0-100)"
     )
 
     # Result validation settings
@@ -156,6 +170,15 @@ class ResilienceConfig(BaseSettings):
     )
     backoff_factor: float = Field(
         default=2.0, ge=1.0, le=10.0, description="Exponential backoff factor"
+    )
+    max_backoff: float = Field(
+        default=30.0, ge=0.1, le=300.0, description="Maximum backoff delay in seconds"
+    )
+    query_concurrency: int = Field(
+        default=10, ge=1, le=1000, description="Max concurrent query executions"
+    )
+    llm_concurrency: int = Field(
+        default=5, ge=1, le=1000, description="Max concurrent LLM API calls"
     )
     circuit_breaker_threshold: int = Field(
         default=5, ge=1, le=100, description="Failures before circuit opens"

@@ -148,6 +148,7 @@ class TestSQLGenerationWithRetry:
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None  # No exception = valid
+        mock_validator.is_write_statement.return_value = False  # Generated SQL is read-only
 
         orchestrator = QueryOrchestrator(
             sql_generator=mock_generator,
@@ -173,6 +174,7 @@ class TestSQLGenerationWithRetry:
         assert validation_result.is_select is True
         mock_generator.generate.assert_called_once()
         mock_validator.validate_or_raise.assert_called_once_with("SELECT * FROM users;")
+        mock_validator.is_write_statement.assert_called_once_with("SELECT * FROM users;")
 
     @pytest.mark.asyncio
     async def test_generate_sql_retry_on_validation_failure(
@@ -200,7 +202,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=3),
+            resilience_config=ResilienceConfig(max_retries=3, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -241,7 +243,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=2),
+            resilience_config=ResilienceConfig(max_retries=2, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -640,7 +642,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=1),
+            resilience_config=ResilienceConfig(max_retries=1, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 

@@ -7,6 +7,8 @@ and error codes for structured error reporting.
 from enum import StrEnum
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 
 class ErrorCode(StrEnum):
     """Standardized error codes for the application."""
@@ -36,25 +38,16 @@ class ErrorCode(StrEnum):
     RESOURCE_EXHAUSTED = "resource_exhausted"
 
 
-class ErrorDetail:
-    """Structured error detail information."""
+class ErrorDetail(BaseModel):
+    """Structured error detail information.
 
-    def __init__(
-        self,
-        code: ErrorCode,
-        message: str,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        """Initialize error detail.
+    This is the single canonical error detail model used throughout the
+    application. It is serialized into MCP responses via ``to_dict``.
+    """
 
-        Args:
-            code: Error code identifier.
-            message: Human-readable error message.
-            details: Optional additional context.
-        """
-        self.code = code
-        self.message = message
-        self.details = details or {}
+    code: str = Field(..., description="Error code identifier")
+    message: str = Field(..., description="Human-readable error message")
+    details: dict[str, Any] | None = Field(None, description="Additional error context")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary representation.

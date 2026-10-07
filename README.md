@@ -15,6 +15,24 @@
 - **Schema 智能化**：自动 Schema 缓存，基于 TTL 的刷新机制
 - **生产就绪**：连接池管理、熔断器、限流、全面的指标收集
 - **MCP 兼容**：支持 Claude Desktop 和任何 MCP 兼容客户端
+## 本次实现要点
+
+本版本针对代码评审（codex review）指出的三项缺口做了补齐，全部以单元测试覆盖：
+
+1. **数据库与安全控制已启用**
+   - 按库选择 SQL 执行器（`sql_executors`），多数据库请求不再固定落到主库执行器
+   - 表 / 列访问限制（`SECURITY_BLOCKED_TABLES` / `SECURITY_BLOCKED_COLUMNS`）与 EXPLAIN 策略（`SECURITY_ALLOW_EXPLAIN`）从配置接线到校验器并生效
+   - `SECURITY_ALLOW_WRITE_OPERATIONS` 真正控制 DML 放行（DDL 仍始终禁止）
+
+2. **弹性与可观测性接入请求流程**
+   - 限流器（查询 / LLM 并发）与指标采集器实际传入 Orchestrator，超限返回 `rate_limit_exceeded`
+   - 重试改用指数退避（`retry_delay * factor^attempt`，受 `max_backoff` 封顶）
+   - 请求 / 生成 / 执行全链路记录指标（query_duration、llm_calls、sql_rejected、db_query_duration 等）
+
+3. **响应 / 模型整洁**
+   - 删除 `QueryResponse.to_dict` 重复定义，统一 `ErrorDetail` 为单一模型
+   - 补用未生效配置字段：`max_question_length`（问题过长拦截）、`CacheConfig.max_size`（超限淘汰）
+
 
 ## 快速开始
 
@@ -266,23 +284,26 @@ Return Type: sql
 
 ### 安全特性
 
-1. **只读强制执行**：默认仅允许 SELECT 查询
+1. **只读强制执行**：默认仅允许 SELECT 查询；`SECURITY_ALLOW_WRITE_OPERATIONS=true` 时放开 INSERT/UPDATE/DELETE/MERGE（DDL 始终禁止）
 2. **阻止危险函数**：黑名单包含危险的 PostgreSQL 函数（pg_sleep、文件 I/O 等）
-3. **SQL 解析**：使用 sqlglot 进行准确的 SQL 结构验证
-4. **注入防护**：参数化查询和输入清理
-5. **资源限制**：
+3. **表 / 列访问限制**：`SECURITY_BLOCKED_TABLES` / `SECURITY_BLOCKED_COLUMNS` 配置的表与列（支持 `schema.table`、`table.column` 限定写法）在校验阶段被拒绝，保护敏感数据
+4. **EXPLAIN 策略**：`SECURITY_ALLOW_EXPLAIN=true` 才允许 EXPLAIN（只读查询计划，不修改数据）
+5. **SQL 解析**：使用 sqlglot 进行准确的 SQL 结构验证
+6. **注入防护**：参数化查询和输入清理
+7. **资源限制**：
    - 行数限制（默认：10,000）
    - 查询超时（默认：30 秒）
    - 连接池管理
-6. **事务隔离**：所有查询在只读事务中运行
+8. **事务隔离**：所有查询在只读事务中运行
 
 ### 弹性特性
 
 - **熔断器**：防止级联 LLM API 失败
-- **限流**：防止 API 配额耗尽
-- **重试逻辑**：自动重试瞬时故障，使用指数退避
+- **限流**：`RESILIENCE_QUERY_CONCURRENCY` / `RESILIENCE_LLM_CONCURRENCY` 控制查询与 LLM 调用并发，超限请求被拒绝（`rate_limit_exceeded`），已接入实际请求流程
+- **重试逻辑**：自动重试瞬时故障，使用指数退避（`retry_delay * factor^attempt`，上限 `RESILIENCE_MAX_BACKOFF`），已接入 SQL 生成流程
 - **连接池**：高效的数据库连接复用
-- **Schema 缓存**：基于 TTL 的缓存减少数据库元数据查询
+- **Schema 缓存**：基于 TTL 的缓存减少数据库元数据查询，`CACHE_MAX_SIZE` 超限时淘汰最旧条目
+- **按库执行器**：多数据库部署时按解析出的数据库选择对应 SQL 执行器，避免请求落到错误数据库
 
 ## 配置参考
 
@@ -311,12 +332,15 @@ Return Type: sql
 
 ### 安全设置
 
-| 变量                              | 描述                      | 默认值            |
-|-----------------------------------|---------------------------|-------------------|
-| `SECURITY_ALLOW_WRITE_OPERATIONS` | 允许 INSERT/UPDATE/DELETE | `false`           |
-| `SECURITY_BLOCKED_FUNCTIONS`      | 逗号分隔的函数黑名单      | 参考 .env.example |
-| `SECURITY_MAX_ROWS`               | 每个查询的最大行数        | `10000`           |
-| `SECURITY_MAX_EXECUTION_TIME`     | 查询超时（秒）              | `30`              |
+| 变量                              | 描述                              | 默认值            |
+|-----------------------------------|-----------------------------------|-------------------|
+| `SECURITY_ALLOW_WRITE_OPERATIONS` | 允许 INSERT/UPDATE/DELETE/MERGE   | `false`           |
+| `SECURITY_BLOCKED_FUNCTIONS`      | 逗号分隔的函数黑名单              | 参考 .env.example |
+| `SECURITY_BLOCKED_TABLES`         | 逗号分隔的表黑名单（含 schema.table） | 空                |
+| `SECURITY_BLOCKED_COLUMNS`        | 逗号分隔的列黑名单（含 table.column） | 空                |
+| `SECURITY_ALLOW_EXPLAIN`          | 允许 EXPLAIN 语句                 | `false`           |
+| `SECURITY_MAX_ROWS`               | 每个查询的最大行数                | `10000`           |
+| `SECURITY_MAX_EXECUTION_TIME`     | 查询超时（秒）                    | `30`              |
 
 ### 缓存设置
 
@@ -328,13 +352,16 @@ Return Type: sql
 
 ### 弹性设置
 
-| 变量                                   | 描述             | 默认值 |
-|----------------------------------------|------------------|--------|
-| `RESILIENCE_MAX_RETRIES`               | 最大重试次数     | `3`    |
-| `RESILIENCE_RETRY_DELAY`               | 初始重试延迟（秒） | `1.0`  |
-| `RESILIENCE_BACKOFF_FACTOR`            | 指数退避倍数     | `2.0`  |
-| `RESILIENCE_CIRCUIT_BREAKER_THRESHOLD` | 熔断前的失败数   | `5`    |
-| `RESILIENCE_CIRCUIT_BREAKER_TIMEOUT`   | 熔断器超时（秒）   | `60`   |
+| 变量                                   | 描述                 | 默认值 |
+|----------------------------------------|----------------------|--------|
+| `RESILIENCE_MAX_RETRIES`               | 最大重试次数         | `3`    |
+| `RESILIENCE_RETRY_DELAY`               | 初始重试延迟（秒）    | `1.0`  |
+| `RESILIENCE_BACKOFF_FACTOR`            | 指数退避倍数         | `2.0`  |
+| `RESILIENCE_MAX_BACKOFF`               | 指数退避上限（秒）     | `30.0` |
+| `RESILIENCE_QUERY_CONCURRENCY`         | 查询最大并发         | `10`   |
+| `RESILIENCE_LLM_CONCURRENCY`           | LLM 调用最大并发      | `5`    |
+| `RESILIENCE_CIRCUIT_BREAKER_THRESHOLD` | 熔断前的失败数       | `5`    |
+| `RESILIENCE_CIRCUIT_BREAKER_TIMEOUT`   | 熔断器超时（秒）      | `60`   |
 
 ### 可观测性设置
 
@@ -343,7 +370,7 @@ Return Type: sql
 | `OBSERVABILITY_METRICS_ENABLED` | 启用 Prometheus 指标 | `true` |
 | `OBSERVABILITY_METRICS_PORT`    | 指标 HTTP 端口       | `9090` |
 | `OBSERVABILITY_LOG_LEVEL`       | 日志级别             | `INFO` |
-| `OBSERVABILITY_LOG_FORMAT`      | 日志格式（json/text）  | `json` |
+| `OBSERVABILITY_LOG_FORMAT`      | 日志格式（json/text）  | `text` |
 
 ## 开发
 

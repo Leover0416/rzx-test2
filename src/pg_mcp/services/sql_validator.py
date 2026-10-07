@@ -30,16 +30,17 @@ class SQLValidator:
         exp.Select, exp.Union, exp.Intersect, exp.Except
     }
 
-    # Allowed top-level expressions (including CTEs)
-    ALLOWED_TOP_LEVEL: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except, exp.With, exp.Subquery
-    }
-
-    # Forbidden statement types
-    FORBIDDEN_STATEMENT_TYPES: ClassVar = {
+    # Write (DML) statement types - only allowed when allow_write_operations is enabled
+    WRITE_STATEMENT_TYPES: ClassVar = {
         exp.Insert,
         exp.Update,
         exp.Delete,
+        exp.Merge,
+    }
+
+    # Statements never allowed regardless of configuration (DDL/admin).
+    # Note: TRUNCATE is parsed as a Command and rejected by the command check.
+    ALWAYS_FORBIDDEN_STATEMENT_TYPES: ClassVar = {
         exp.Drop,
         exp.Create,
         exp.Alter,
@@ -48,7 +49,6 @@ class SQLValidator:
         exp.Set,
         exp.Command,
         exp.Use,
-        exp.Merge,
     }
 
     # Built-in dangerous PostgreSQL functions
@@ -79,20 +79,31 @@ class SQLValidator:
         config: SecurityConfig,
         blocked_tables: list[str] | None = None,
         blocked_columns: list[str] | None = None,
-        allow_explain: bool = False,
+        allow_explain: bool | None = None,
     ) -> None:
         """Initialize SQL validator.
 
         Args:
             config: Security configuration containing blocked functions and settings.
             blocked_tables: Optional list of table names to block access to.
+                Defaults to ``config.blocked_tables`` when not provided.
             blocked_columns: Optional list of column names to block access to.
+                Defaults to ``config.blocked_columns`` when not provided.
             allow_explain: Whether to allow EXPLAIN statements.
+                Defaults to ``config.allow_explain`` when not provided.
         """
         self.config = config
-        self.blocked_tables = {t.lower() for t in (blocked_tables or [])}
-        self.blocked_columns = {c.lower() for c in (blocked_columns or [])}
-        self.allow_explain = allow_explain
+        self.blocked_tables = {
+            t.lower()
+            for t in (blocked_tables if blocked_tables is not None else config.blocked_tables)
+        }
+        self.blocked_columns = {
+            c.lower()
+            for c in (blocked_columns if blocked_columns is not None else config.blocked_columns)
+        }
+        self.allow_explain = (
+            allow_explain if allow_explain is not None else config.allow_explain
+        )
 
         # Combine built-in dangerous functions with custom blocked functions
         self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
@@ -202,18 +213,29 @@ class SQLValidator:
         Returns:
             Error message if check fails, None otherwise.
         """
-        # Check for forbidden statement types
-        for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
+        # Never allow DDL/admin statements regardless of write policy
+        for forbidden_type in self.ALWAYS_FORBIDDEN_STATEMENT_TYPES:
             if isinstance(statement, forbidden_type):
                 stmt_name = forbidden_type.__name__.upper()
                 return f"{stmt_name} statements are not allowed. Only SELECT queries are permitted."
 
-        # Ensure statement is an allowed type (SELECT or set operations)
-        if not isinstance(statement, tuple(self.ALLOWED_STATEMENT_TYPES)):
-            stmt_type = type(statement).__name__
-            return f"Statement type {stmt_type} is not allowed. Only SELECT queries are permitted."
+        # Determine allowed set based on write policy
+        allowed_types: set[type[exp.Expression]] = set(self.ALLOWED_STATEMENT_TYPES)
+        if self.config.allow_write_operations:
+            allowed_types |= self.WRITE_STATEMENT_TYPES
 
-        return None
+        if isinstance(statement, tuple(allowed_types)):
+            return None
+
+        # Write statements are gated by the write policy
+        if isinstance(statement, tuple(self.WRITE_STATEMENT_TYPES)):
+            return (
+                "Write operations (INSERT/UPDATE/DELETE/MERGE) are not allowed. "
+                "Enable SECURITY_ALLOW_WRITE_OPERATIONS to permit them."
+            )
+
+        stmt_type = type(statement).__name__
+        return f"Statement type {stmt_type} is not allowed. Only SELECT queries are permitted."
 
     def _check_dangerous_functions(self, statement: exp.Expression) -> str | None:
         """Check for use of blocked/dangerous functions.
@@ -249,8 +271,15 @@ class SQLValidator:
         for table in statement.find_all(exp.Table):
             table_name = table.name.lower() if table.name else ""
 
+            # Check for exact match on bare table name
             if table_name in self.blocked_tables:
                 return f"Access to table '{table_name}' is not allowed"
+
+            # Check for schema-qualified name (schema.table)
+            if table.db:
+                qualified_name = f"{table.db.lower()}.{table_name}"
+                if qualified_name in self.blocked_tables:
+                    return f"Access to table '{qualified_name}' is not allowed"
 
         return None
 
@@ -296,13 +325,13 @@ class SQLValidator:
             if subquery.this:
                 inner_stmt = subquery.this
 
-                # Check if the inner statement is a forbidden type
-                for forbidden_type in self.FORBIDDEN_STATEMENT_TYPES:
+                # Check if the inner statement is a never-allowed type
+                for forbidden_type in self.ALWAYS_FORBIDDEN_STATEMENT_TYPES:
                     if isinstance(inner_stmt, forbidden_type):
                         stmt_name = forbidden_type.__name__.upper()
                         return f"{stmt_name} statements in subqueries are not allowed"
 
-                # Ensure it's a SELECT
+                # Subqueries must resolve to SELECT/WITH (DML in a subquery is invalid SQL)
                 if not isinstance(inner_stmt, (exp.Select, exp.With)):
                     return "Subqueries must contain only SELECT statements"
 
@@ -329,6 +358,30 @@ class SQLValidator:
             return parsed.sql(dialect="postgres", pretty=False)
         except Exception as e:
             raise SQLParseError(f"Failed to normalize SQL: {e}") from e
+
+    def is_write_statement(self, sql: str) -> bool:
+        """Determine whether a SQL statement performs a data-modifying operation.
+
+        Args:
+            sql: SQL query string.
+
+        Returns:
+            bool: True if the statement is INSERT/UPDATE/DELETE/MERGE.
+
+        Raises:
+            SQLParseError: If SQL cannot be parsed.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, read="postgres")
+        except Exception as e:
+            raise SQLParseError(f"Failed to parse SQL: {e}") from e
+
+        statement: exp.Expression = parsed
+        # Unwrap WITH (CTE) to inspect the main query body
+        if isinstance(statement, exp.With) and statement.this is not None:
+            statement = statement.this
+
+        return isinstance(statement, tuple(self.WRITE_STATEMENT_TYPES))
 
     def extract_tables(self, sql: str) -> list[str]:
         """Extract all table names referenced in the SQL query.
