@@ -5,8 +5,10 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
+from dotenv import load_dotenv
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -216,6 +218,17 @@ class Settings(BaseSettings):
     environment: Literal["development", "staging", "production"] = Field(
         default="development", description="Application environment"
     )
+
+    def __init__(self, **values: Any) -> None:
+        # pydantic-settings does not propagate the parent's ``env_file=".env"``
+        # into nested sub-config models (DatabaseConfig/OpenAIConfig/...), so
+        # ``cp .env.example .env`` alone would leave them at defaults. Load the
+        # project-root ``.env`` into the process environment explicitly so the
+        # documented env-file workflow works, while still letting real env vars
+        # (which take precedence) override.
+        project_root = Path(__file__).resolve().parents[3]
+        load_dotenv(project_root / ".env", override=False)
+        super().__init__(**values)
 
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)

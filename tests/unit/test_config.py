@@ -420,3 +420,16 @@ class TestSettingsGlobalInstance:
         assert settings.openai.model == "gpt-4"
         assert settings.database.host == "env.host.com"
         assert settings.security.max_rows == 5000
+
+    def test_settings_reads_nested_environment_variables(self) -> None:
+        """Regression: nested sub-configs must read env vars even when the
+        parent Settings declares ``env_file`` (pydantic-settings does not
+        propagate the parent's env_file into nested models by default)."""
+        os.environ["OPENAI_API_KEY"] = "sk-nested-env"
+        os.environ["DATABASE_NAME"] = "nested_db"
+
+        reset_settings()
+        settings = get_settings()
+
+        assert settings.openai.api_key.get_secret_value() == "sk-nested-env"
+        assert settings.database.name == "nested_db"
