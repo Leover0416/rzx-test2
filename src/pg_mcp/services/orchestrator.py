@@ -8,9 +8,7 @@ request flow, and selects the correct per-database executor for each request.
 """
 
 import asyncio
-import logging
 import time
-import uuid
 from typing import Any
 
 from asyncpg import Pool
@@ -36,6 +34,7 @@ from pg_mcp.models.query import (
     ValidationResult,
 )
 from pg_mcp.observability.metrics import MetricsCollector
+from pg_mcp.observability.tracing import get_request_id, get_tracing_logger, request_context
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.result_validator import ResultValidator
@@ -43,7 +42,7 @@ from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
 from pg_mcp.services.sql_validator import SQLValidator
 
-logger = logging.getLogger(__name__)
+logger = get_tracing_logger(__name__)
 
 # Default timeout (seconds) to wait for a rate-limit slot before failing the request.
 _DEFAULT_RATE_LIMIT_TIMEOUT = 30.0
@@ -77,7 +76,7 @@ class QueryOrchestrator:
         self,
         sql_generator: SQLGenerator,
         sql_validator: SQLValidator,
-        sql_executor: SQLExecutor,
+        sql_executor: SQLExecutor | None,
         result_validator: ResultValidator,
         schema_cache: SchemaCache,
         pools: dict[str, Pool],
@@ -87,6 +86,7 @@ class QueryOrchestrator:
         sql_executors: dict[str, SQLExecutor] | None = None,
         rate_limiter: MultiRateLimiter | None = None,
         metrics: MetricsCollector | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
         rate_limit_timeout: float = _DEFAULT_RATE_LIMIT_TIMEOUT,
     ) -> None:
         """Initialize query orchestrator.
@@ -107,6 +107,8 @@ class QueryOrchestrator:
                 When provided, rate limits are enforced on the request flow.
             metrics: Optional metrics collector. When provided, request/LLM/security
                 metrics are recorded.
+            circuit_breaker: Optional lifecycle-managed breaker for LLM calls.
+                A private breaker is created only when one is not supplied.
             rate_limit_timeout: Seconds to wait for a rate-limit slot before failing.
         """
         self.sql_generator = sql_generator
@@ -122,10 +124,13 @@ class QueryOrchestrator:
         self.metrics = metrics
         self.rate_limit_timeout = rate_limit_timeout
 
-        # Create circuit breaker for LLM calls
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=resilience_config.circuit_breaker_threshold,
-            recovery_timeout=resilience_config.circuit_breaker_timeout,
+        self.circuit_breaker = (
+            circuit_breaker
+            if circuit_breaker is not None
+            else CircuitBreaker(
+                failure_threshold=resilience_config.circuit_breaker_threshold,
+                recovery_timeout=resilience_config.circuit_breaker_timeout,
+            )
         )
 
     async def execute_query(self, request: QueryRequest) -> QueryResponse:
@@ -154,7 +159,19 @@ class QueryOrchestrator:
             >>> if response.success:
             ...     print(f"Found {response.data.row_count} rows")
         """
-        request_id = str(uuid.uuid4())
+        inherited_request_id = get_request_id()
+        if inherited_request_id is not None:
+            return await self._execute_query_in_context(request, inherited_request_id)
+
+        async with request_context() as request_id:
+            return await self._execute_query_in_context(request, request_id)
+
+    async def _execute_query_in_context(
+        self,
+        request: QueryRequest,
+        request_id: str,
+    ) -> QueryResponse:
+        """Execute a request while its tracing context is active."""
         start_time = time.monotonic()
 
         # Step 0: Enforce configured max question length
@@ -483,7 +500,7 @@ class QueryOrchestrator:
         question: str,
         schema: Any,
         request_id: str,
-    ) -> tuple[str, ValidationResult, int | None]:
+    ) -> tuple[str, ValidationResult, int]:
         """Generate and validate SQL with retry logic on validation failures.
 
         This method implements a retry loop that:
@@ -518,7 +535,7 @@ class QueryOrchestrator:
         previous_sql: str | None = None
         error_feedback: str | None = None
         max_retries = self.resilience_config.max_retries
-        tokens_used: int | None = None
+        tokens_used = 0
 
         for attempt in range(max_retries + 1):
             try:
@@ -533,7 +550,7 @@ class QueryOrchestrator:
 
                 # Generate SQL under the LLM rate limiter
                 llm_start = time.monotonic()
-                generated_sql = await self._limited_llm_call(
+                generation_result: Any = await self._limited_llm_call(
                     lambda prev=previous_sql, fb=error_feedback: self.sql_generator.generate(
                         question=question,
                         schema=schema,
@@ -543,8 +560,30 @@ class QueryOrchestrator:
                     operation="generate_sql",
                     request_id=request_id,
                 )
+                if isinstance(generation_result, str):
+                    # Compatibility with test doubles and third-party generators that
+                    # still implement the original string-only protocol.
+                    generated_sql = generation_result
+                    attempt_tokens = 0
+                elif hasattr(generation_result, "sql") and hasattr(
+                    generation_result, "tokens_used"
+                ):
+                    generated_sql = generation_result.sql
+                    attempt_tokens = generation_result.tokens_used
+                else:
+                    # Accept the conventional ``(sql, tokens_used)`` protocol too.
+                    generated_sql, attempt_tokens = generation_result
+
+                if not isinstance(generated_sql, str) or not isinstance(attempt_tokens, int):
+                    raise TypeError("SQL generator returned an invalid result")
+                if attempt_tokens < 0:
+                    raise ValueError("SQL generator returned negative token usage")
+
+                tokens_used += attempt_tokens
                 if self.metrics is not None:
                     self.metrics.observe_llm_latency("generate_sql", time.monotonic() - llm_start)
+                    if attempt_tokens:
+                        self.metrics.increment_llm_tokens("generate_sql", attempt_tokens)
 
                 logger.debug(
                     "SQL generated",
@@ -614,7 +653,10 @@ class QueryOrchestrator:
 
                 return generated_sql, validation_result, tokens_used
 
-            except (LLMError, SecurityViolationError, SQLParseError):
+            except LLMError:
+                self.circuit_breaker.record_failure()
+                raise
+            except (SecurityViolationError, SQLParseError):
                 raise
             except RateLimitExceededError:
                 raise
@@ -658,9 +700,7 @@ class QueryOrchestrator:
             self.metrics.increment_llm_call(operation)
 
         if self.rate_limiter is not None:
-            acquired = await self.rate_limiter.llm_limiter.acquire(
-                timeout=self.rate_limit_timeout
-            )
+            acquired = await self.rate_limiter.llm_limiter.acquire(timeout=self.rate_limit_timeout)
             if not acquired:
                 raise RateLimitExceededError(
                     message="Too many concurrent LLM calls, request rejected by rate limiter",

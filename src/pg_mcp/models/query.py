@@ -25,7 +25,9 @@ class QueryRequest(BaseModel):
     question: str = Field(
         ...,
         min_length=1,
-        max_length=10000,
+        # Keep a hard safety ceiling while allowing ValidationConfig to set the
+        # effective deployment-specific limit (up to its documented 50,000).
+        max_length=50000,
         description="Natural language question about the data",
     )
     database: str | None = Field(

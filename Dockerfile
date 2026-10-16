@@ -86,10 +86,10 @@ USER pgmcp
 # Expose Prometheus metrics port
 EXPOSE 9090
 
-# Health check
-# Check if the process is running
+# Health check: use the Python standard library already present in the image.
+# The metrics endpoint is started only after the application is initialized.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import psutil; exit(0 if any('python' in p.name() for p in psutil.process_iter()) else 1)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/metrics', timeout=5).read(1)" || exit 1
 
 # Default command
 # Run the MCP server

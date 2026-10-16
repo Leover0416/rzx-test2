@@ -5,6 +5,7 @@ It ensures that only safe, read-only queries are executed and blocks potentially
 dangerous operations.
 """
 
+import re
 from typing import ClassVar
 
 import sqlglot
@@ -26,9 +27,7 @@ class SQLValidator:
     """
 
     # Allowed statement types at the top level (including set operations)
-    ALLOWED_STATEMENT_TYPES: ClassVar = {
-        exp.Select, exp.Union, exp.Intersect, exp.Except
-    }
+    ALLOWED_STATEMENT_TYPES: ClassVar = {exp.Select, exp.Union, exp.Intersect, exp.Except}
 
     # Write (DML) statement types - only allowed when allow_write_operations is enabled
     WRITE_STATEMENT_TYPES: ClassVar = {
@@ -101,9 +100,7 @@ class SQLValidator:
             c.lower()
             for c in (blocked_columns if blocked_columns is not None else config.blocked_columns)
         }
-        self.allow_explain = (
-            allow_explain if allow_explain is not None else config.allow_explain
-        )
+        self.allow_explain = allow_explain if allow_explain is not None else config.allow_explain
 
         # Combine built-in dangerous functions with custom blocked functions
         self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
@@ -167,11 +164,11 @@ class SQLValidator:
             if cmd_name == "EXPLAIN":
                 if not self.allow_explain:
                     raise SecurityViolationError("EXPLAIN statements are not allowed")
-                # EXPLAIN is read-only and safe - it only shows query plans without executing.
-                # sqlglot 28.5.0 cannot parse EXPLAIN syntax reliably (falls back to Command),
-                # so we don't attempt to validate the inner query string to avoid false positives.
-                # Even "EXPLAIN DELETE" is safe as it won't actually delete data.
-                return None
+                inner_sql = self._extract_explain_query(statement)
+                # Validate the explained statement with the same table, column,
+                # function, statement-type, and multi-statement policy.
+                self.validate_or_raise(inner_sql)
+                return
             else:
                 # Other commands are not allowed
                 raise SecurityViolationError(
@@ -295,6 +292,30 @@ class SQLValidator:
         if not self.blocked_columns:
             return None
 
+        table_aliases: dict[str, str] = {}
+        referenced_tables: set[str] = set()
+        for table in statement.find_all(exp.Table):
+            table_name = table.name.lower() if table.name else ""
+            if not table_name:
+                continue
+            referenced_tables.add(table_name)
+            table_aliases[table_name] = table_name
+            if table.alias:
+                table_aliases[table.alias.lower()] = table_name
+
+        # A projection wildcard can expand to a blocked column without naming
+        # it in the AST. Reject SELECT * / table.* conservatively whenever a
+        # column deny-list is configured; COUNT(*) remains safe and allowed.
+        for select in statement.find_all(exp.Select):
+            for projection in select.expressions:
+                if isinstance(projection, exp.Star) or (
+                    isinstance(projection, exp.Column) and projection.is_star
+                ):
+                    return (
+                        "Wildcard column selection is not allowed when blocked columns "
+                        "are configured"
+                    )
+
         # Find all column references
         for column in statement.find_all(exp.Column):
             column_name = column.name.lower() if column.name else ""
@@ -305,14 +326,64 @@ class SQLValidator:
 
             # Check for qualified column names (table.column)
             if column.table:
-                qualified_name = f"{column.table.lower()}.{column_name}"
-                if qualified_name in self.blocked_columns:
-                    return f"Access to column '{qualified_name}' is not allowed"
+                qualifier = column.table.lower()
+                qualified_name = f"{qualifier}.{column_name}"
+                physical_table = table_aliases.get(qualifier, qualifier)
+                physical_name = f"{physical_table}.{column_name}"
+                if qualified_name in self.blocked_columns or physical_name in self.blocked_columns:
+                    return f"Access to column '{physical_name}' is not allowed"
+            else:
+                # A bare column may still resolve to a table-qualified deny-list
+                # entry. Match it against every physical table referenced by the
+                # statement rather than allowing aliases/unqualified syntax to bypass.
+                for table_name in referenced_tables:
+                    qualified_name = f"{table_name}.{column_name}"
+                    if qualified_name in self.blocked_columns:
+                        return f"Access to column '{qualified_name}' is not allowed"
 
         return None
 
+    def _extract_explain_query(self, statement: exp.Command) -> str:
+        """Extract and safely constrain the statement wrapped by EXPLAIN.
+
+        SQLGlot currently represents PostgreSQL EXPLAIN as a generic Command.
+        ``EXPLAIN ANALYZE`` is never accepted because PostgreSQL executes the
+        wrapped statement when ANALYZE is enabled.
+        """
+        expression = statement.expression
+        payload = str(expression.this) if isinstance(expression, exp.Literal) else ""
+        payload = payload.strip()
+        if not payload:
+            raise SQLParseError("EXPLAIN statement has no query")
+
+        parenthesized = re.match(r"^\((?P<options>[^)]*)\)\s*(?P<query>.+)$", payload, re.DOTALL)
+        if parenthesized is not None:
+            options = parenthesized.group("options")
+            if re.search(r"\bANALYZE\b", options, re.IGNORECASE):
+                raise SecurityViolationError(
+                    "EXPLAIN ANALYZE is not allowed because it executes the query"
+                )
+            return parenthesized.group("query").strip()
+
+        # PostgreSQL also accepts the legacy `EXPLAIN [ANALYZE] [VERBOSE]`
+        # form. Strip VERBOSE, but fail closed on ANALYZE.
+        remaining = payload
+        while True:
+            option = re.match(r"^(?P<option>ANALYZE|VERBOSE)\b\s*(?P<rest>.*)$", remaining, re.I)
+            if option is None:
+                break
+            if option.group("option").upper() == "ANALYZE":
+                raise SecurityViolationError(
+                    "EXPLAIN ANALYZE is not allowed because it executes the query"
+                )
+            remaining = option.group("rest").strip()
+
+        if not remaining:
+            raise SQLParseError("EXPLAIN statement has no query")
+        return remaining
+
     def _check_subquery_safety(self, statement: exp.Expression) -> str | None:
-        """Check that all subqueries only contain SELECT statements.
+        """Check that all CTEs and subqueries obey the statement policy.
 
         Args:
             statement: Parsed SQL statement.
@@ -320,6 +391,14 @@ class SQLValidator:
         Returns:
             Error message if check fails, None otherwise.
         """
+        # Data-modifying CTEs are legal PostgreSQL and can hide writes behind
+        # a top-level SELECT, so validate every CTE body explicitly.
+        for cte in statement.find_all(exp.CTE):
+            if cte.this is None:
+                return "CTE has no query body"
+            if error := self._check_statement_type(cte.this):
+                return f"Unsafe CTE: {error}"
+
         # Find all subqueries
         for subquery in statement.find_all(exp.Subquery):
             if subquery.this:
@@ -377,11 +456,7 @@ class SQLValidator:
             raise SQLParseError(f"Failed to parse SQL: {e}") from e
 
         statement: exp.Expression = parsed
-        # Unwrap WITH (CTE) to inspect the main query body
-        if isinstance(statement, exp.With) and statement.this is not None:
-            statement = statement.this
-
-        return isinstance(statement, tuple(self.WRITE_STATEMENT_TYPES))
+        return any(isinstance(node, tuple(self.WRITE_STATEMENT_TYPES)) for node in statement.walk())
 
     def extract_tables(self, sql: str) -> list[str]:
         """Extract all table names referenced in the SQL query.

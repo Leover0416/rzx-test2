@@ -5,11 +5,12 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
+import os
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -227,17 +228,49 @@ class Settings(BaseSettings):
         # documented env-file workflow works, while still letting real env vars
         # (which take precedence) override.
         project_root = Path(__file__).resolve().parents[3]
+        env_keys_before = set(os.environ)
         load_dotenv(project_root / ".env", override=False)
-        super().__init__(**values)
+        try:
+            super().__init__(**values)
+        finally:
+            # ``load_dotenv`` is only a bridge for nested BaseSettings models.
+            # Do not leak project-file values into later Settings instances or tests.
+            for key in set(os.environ) - env_keys_before:
+                del os.environ[key]
 
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    databases: list[DatabaseConfig] = Field(
+        default_factory=list,
+        description=(
+            "Database configurations. Set DATABASES to a JSON array for multi-database "
+            "deployments; the legacy DATABASE_* variables remain supported."
+        ),
+    )
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    @model_validator(mode="after")
+    def normalize_databases(self) -> "Settings":
+        """Normalize legacy and multi-database settings into one canonical list."""
+        if not self.databases:
+            if "databases" in self.model_fields_set:
+                raise ValueError("At least one database must be configured")
+            self.databases = [self.database]
+        else:
+            # Keep the legacy singular accessor as an alias for the primary database.
+            self.database = self.databases[0]
+
+        names = [config.name for config in self.databases]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            duplicate_names = ", ".join(duplicates)
+            raise ValueError(f"Database names must be unique; duplicates: {duplicate_names}")
+        return self
 
     @property
     def is_production(self) -> bool:

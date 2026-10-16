@@ -130,7 +130,7 @@ You can add any of these optional parameters to customize behavior:
 
         "OPENAI_API_KEY": "sk-...",
         "OPENAI_MODEL": "gpt-5.2-mini",
-        "OPENAI_MAX_TOKENS": "32000",
+        "OPENAI_MAX_TOKENS": "4000",
         "OPENAI_TEMPERATURE": "0.0",
 
         "SECURITY_ALLOW_WRITE_OPERATIONS": "false",

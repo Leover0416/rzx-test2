@@ -150,6 +150,26 @@ class TestSQLExecutor:
         # Verify session parameters were set
         assert mock_connection.execute.call_count >= 2  # timeout and search_path
         mock_connection.fetch.assert_called_once_with(sql)
+        mock_connection.transaction.assert_called_once_with(readonly=True)
+
+    @pytest.mark.asyncio
+    async def test_write_enabled_uses_read_write_transaction(
+        self,
+        mock_pool: MagicMock,
+        mock_connection: MagicMock,
+        db_config: DatabaseConfig,
+    ) -> None:
+        """Execution honors the same write policy enforced by SQLValidator."""
+        executor = SQLExecutor(
+            pool=mock_pool,
+            security_config=SecurityConfig(allow_write_operations=True),
+            db_config=db_config,
+        )
+        mock_connection.fetch.return_value = []
+
+        await executor.execute("UPDATE users SET active = true")
+
+        mock_connection.transaction.assert_called_once_with(readonly=False)
 
     @pytest.mark.asyncio
     async def test_execute_with_custom_timeout_and_max_rows(

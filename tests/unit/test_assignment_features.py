@@ -106,6 +106,33 @@ class TestSQLValidatorAccessControls:
         assert not ok
         assert "email" in err or "not allowed" in err
 
+    def test_blocked_qualified_column_cannot_be_bypassed_by_aliases(
+        self, base_config: SecurityConfig
+    ) -> None:
+        """table.column rules apply to aliases and unqualified references."""
+        validator = SQLValidator(base_config, blocked_columns=["users.email"])
+
+        for sql in (
+            "SELECT u.email FROM users AS u",
+            "SELECT email FROM users",
+        ):
+            ok, err = validator.validate(sql)
+            assert not ok
+            assert "users.email" in err
+
+    def test_blocked_columns_reject_projection_wildcards(self, base_config: SecurityConfig) -> None:
+        """SELECT * cannot silently expand to a denied column."""
+        validator = SQLValidator(base_config, blocked_columns=["password"])
+
+        for sql in ("SELECT * FROM users", "SELECT users.* FROM users"):
+            ok, err = validator.validate(sql)
+            assert not ok
+            assert "Wildcard" in err
+
+        ok, err = validator.validate("SELECT COUNT(*) FROM users")
+        assert ok
+        assert err is None
+
     def test_allowed_table_and_column_pass(self, base_config: SecurityConfig) -> None:
         """Non-blocked tables/columns are permitted."""
         validator = SQLValidator(base_config, blocked_tables=["secret"], blocked_columns=["ssn"])
@@ -127,6 +154,23 @@ class TestSQLValidatorAccessControls:
         assert ok
         assert err is None
 
+    def test_explain_still_enforces_access_controls(self) -> None:
+        """Enabling EXPLAIN must not bypass the wrapped query's policy."""
+        config = SecurityConfig(
+            allow_explain=True,
+            blocked_tables=["secret_table"],
+            blocked_functions=["pg_sleep"],
+        )
+        validator = SQLValidator(config)
+
+        for sql in (
+            "EXPLAIN SELECT id FROM secret_table",
+            "EXPLAIN SELECT pg_sleep(1)",
+        ):
+            ok, err = validator.validate(sql)
+            assert not ok
+            assert err is not None
+
     def test_explain_enabled_via_config(self) -> None:
         """allow_explain falls back to the security config value."""
         config = SecurityConfig(allow_explain=True)
@@ -141,8 +185,7 @@ class TestSQLValidatorAccessControls:
             "INSERT INTO users(name) VALUES ('x')",
             "UPDATE users SET name='x'",
             "DELETE FROM users",
-            "MERGE INTO users USING (SELECT 1) s ON true "
-            "WHEN MATCHED THEN UPDATE SET name='x'",
+            "MERGE INTO users USING (SELECT 1) s ON true WHEN MATCHED THEN UPDATE SET name='x'",
         ]
         for sql in write_sqls:
             ok, err = validator.validate(sql)
@@ -156,6 +199,18 @@ class TestSQLValidatorAccessControls:
         ok, err = validator.validate("INSERT INTO users(name) VALUES ('x')")
         assert ok
         assert err is None
+
+    def test_data_modifying_cte_obeys_write_policy(self) -> None:
+        """A top-level SELECT cannot hide a DELETE inside a CTE."""
+        sql = "WITH removed AS (DELETE FROM users RETURNING id) SELECT id FROM removed"
+
+        denied, error = SQLValidator(SecurityConfig()).validate(sql)
+        assert not denied
+        assert "Unsafe CTE" in error
+
+        allowed, error = SQLValidator(SecurityConfig(allow_write_operations=True)).validate(sql)
+        assert allowed
+        assert error is None
 
     def test_ddl_still_denied_when_writes_enabled(self) -> None:
         """DDL stays forbidden even with write operations enabled."""
@@ -174,9 +229,15 @@ class TestSQLValidatorAccessControls:
         assert validator.is_write_statement("UPDATE users SET name='x'") is True
         assert validator.is_write_statement("DELETE FROM users") is True
         # CTE wrapping a write is still a write
-        assert validator.is_write_statement(
-            "WITH t AS (SELECT 1) UPDATE users SET name='x'"
-        ) is True
+        assert (
+            validator.is_write_statement("WITH t AS (SELECT 1) UPDATE users SET name='x'") is True
+        )
+        assert (
+            validator.is_write_statement(
+                "WITH t AS (DELETE FROM users RETURNING id) SELECT id FROM t"
+            )
+            is True
+        )
 
 
 # ---------------------------------------------------------------------------

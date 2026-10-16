@@ -72,9 +72,14 @@ async def create_pools(configs: list[DatabaseConfig]) -> dict[str, Pool]:
     """
     pools: dict[str, Pool] = {}
 
-    for config in configs:
-        pool = await create_pool(config)
-        pools[config.name] = pool
+    try:
+        for config in configs:
+            pool = await create_pool(config)
+            pools[config.name] = pool
+    except Exception:
+        # Avoid leaking pools that were created before a later database failed.
+        await close_pools(pools)
+        raise
 
     return pools
 
@@ -108,9 +113,7 @@ async def close_pools(pools: dict[str, Pool], timeout: float = 10.0) -> None:  #
             logger.info(f"Connection pool for '{db_name}' closed gracefully")
         except TimeoutError:
             # Force termination if graceful close times out
-            logger.warning(
-                f"Graceful close timed out for '{db_name}', forcing termination"
-            )
+            logger.warning(f"Graceful close timed out for '{db_name}', forcing termination")
             pool.terminate()
             logger.info(f"Connection pool for '{db_name}' terminated")
         except Exception as e:

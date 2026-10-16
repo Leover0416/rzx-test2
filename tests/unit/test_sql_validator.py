@@ -476,30 +476,36 @@ class TestExplainStatements:
         assert is_valid
         assert error is None
 
-    def test_explain_analyze_allowed(self) -> None:
-        """Test EXPLAIN ANALYZE is allowed when EXPLAIN is enabled."""
+    def test_explain_analyze_rejected(self) -> None:
+        """EXPLAIN ANALYZE executes its query and is therefore rejected."""
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
         sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE id > 100"
         is_valid, error = validator.validate(sql)
-        assert is_valid
-        assert error is None
+        assert not is_valid
+        assert "executes the query" in error
 
-    def test_explain_with_dangerous_query_allowed(self) -> None:
-        """Test EXPLAIN with dangerous underlying query is allowed.
-
-        EXPLAIN only shows query plans and doesn't execute the query,
-        so even "EXPLAIN DELETE" is safe as it won't modify data.
-        """
+    def test_explain_write_obeys_write_policy(self) -> None:
+        """The statement wrapped by EXPLAIN still follows the write policy."""
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
-        # EXPLAIN DELETE is safe - it only shows the execution plan
         sql = "EXPLAIN DELETE FROM users"
         is_valid, error = validator.validate(sql)
-        assert is_valid
-        assert error is None
+        assert not is_valid
+        assert "Write operations" in error
+
+    def test_parenthesized_explain_analyze_rejected(self) -> None:
+        """Parenthesized PostgreSQL EXPLAIN options cannot hide ANALYZE."""
+        validator = SQLValidator(SecurityConfig(), allow_explain=True)
+
+        is_valid, error = validator.validate(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) DELETE FROM users"
+        )
+
+        assert not is_valid
+        assert "executes the query" in error
 
 
 class TestValidatorHelperMethods:

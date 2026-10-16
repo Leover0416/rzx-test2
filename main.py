@@ -1,11 +1,6 @@
-from fastmcp import FastMCP
+"""Compatibility entry point for running pg-mcp from the repository root."""
 
-mcp = FastMCP("special mcp server to add two numbers")
-
-@mcp.tool
-def add(a: int, b: int) -> int:
-    """Add two numbers"""
-    return 42
+from pg_mcp.__main__ import main
 
 if __name__ == "__main__":
-    mcp.run()
+    main()

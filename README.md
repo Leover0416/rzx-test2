@@ -17,17 +17,17 @@
 - **MCP 兼容**：支持 Claude Desktop 和任何 MCP 兼容客户端
 ## 本次实现要点
 
-本版本针对代码评审（codex review）指出的三项缺口做了补齐，全部以单元测试覆盖：
+本版本针对代码评审（codex review）指出的缺口做了补齐，全部以单元测试覆盖：
 
 1. **数据库与安全控制已启用**
-   - 按库选择 SQL 执行器（`sql_executors`），多数据库请求不再固定落到主库执行器
+   - `DATABASES` JSON 数组可声明多套数据库连接；服务启动时为每个数据库创建独立连接池和 SQL 执行器，请求不再固定落到主库
    - 表 / 列访问限制（`SECURITY_BLOCKED_TABLES` / `SECURITY_BLOCKED_COLUMNS`）与 EXPLAIN 策略（`SECURITY_ALLOW_EXPLAIN`）从配置接线到校验器并生效
    - `SECURITY_ALLOW_WRITE_OPERATIONS` 真正控制 DML 放行（DDL 仍始终禁止）
 
 2. **弹性与可观测性接入请求流程**
-   - 限流器（查询 / LLM 并发）与指标采集器实际传入 Orchestrator，超限返回 `rate_limit_exceeded`
+   - 生命周期创建的熔断器、限流器（查询 / LLM 并发）与指标采集器实际传入 Orchestrator，超限返回 `rate_limit_exceeded`
    - 重试改用指数退避（`retry_delay * factor^attempt`，受 `max_backoff` 封顶）
-   - 请求 / 生成 / 执行全链路记录指标（query_duration、llm_calls、sql_rejected、db_query_duration 等）
+   - `request_context` 覆盖完整请求链路；请求 / 生成 / 执行记录指标，并从 OpenAI `usage.total_tokens` 返回及累计 token 用量
 
 3. **响应 / 模型整洁**
    - 删除 `QueryResponse.to_dict` 重复定义，统一 `ErrorDetail` 为单一模型
@@ -104,6 +104,14 @@ SECURITY_ALLOW_WRITE_OPERATIONS=false
 SECURITY_MAX_ROWS=10000
 SECURITY_MAX_EXECUTION_TIME=30
 ```
+
+多数据库部署使用 `DATABASES`（JSON 数组）；它存在时会覆盖上面的单数据库配置：
+
+```bash
+DATABASES=[{"name":"app","host":"db-app","port":5432,"user":"app","password":"secret"},{"name":"analytics","host":"db-analytics","port":5432,"user":"reporter","password":"secret"}]
+```
+
+每个名称必须唯一。配置多个数据库时，调用 `query` 必须传入 `database`；仅配置一个数据库时仍会自动选择，原有 `DATABASE_*` 配置完全兼容。
 
 完整的配置选项请参考 `.env.example`。
 
@@ -326,7 +334,7 @@ Return Type: sql
 |----------------------|-------------------------|----------------|
 | `OPENAI_API_KEY`     | OpenAI API 密钥         | 必需           |
 | `OPENAI_MODEL`       | 使用的模型              | `gpt-5.2-mini` |
-| `OPENAI_MAX_TOKENS`  | 每次请求的最大 token 数 | `32000`        |
+| `OPENAI_MAX_TOKENS`  | 每次请求的最大输出 token 数 | `4000`        |
 | `OPENAI_TEMPERATURE` | 模型温度                | `0.0`          |
 | `OPENAI_TIMEOUT`     | API 超时（秒）            | `30`           |
 
@@ -494,12 +502,15 @@ curl http://localhost:9090/metrics
 
 **可用指标：**
 
-- `pg_mcp_queries_total` - 已处理的总查询数
+- `pg_mcp_query_requests_total` - 已处理的总查询数（按状态、数据库区分）
 - `pg_mcp_query_duration_seconds` - 查询执行时间直方图
-- `pg_mcp_sql_generation_duration_seconds` - SQL 生成时间
-- `pg_mcp_sql_validation_failures_total` - 验证失败次数
-- `pg_mcp_database_errors_total` - 数据库错误数
+- `pg_mcp_llm_calls_total` - LLM 调用次数（按操作区分）
+- `pg_mcp_llm_latency_seconds` - LLM 调用耗时
 - `pg_mcp_llm_tokens_used_total` - LLM token 使用总数
+- `pg_mcp_sql_rejected_total` - SQL 安全校验拒绝次数
+- `pg_mcp_db_connections_active` - 数据库连接数
+- `pg_mcp_db_query_duration_seconds` - 数据库查询耗时
+- `pg_mcp_schema_cache_age_seconds` - Schema 缓存年龄
 
 ### 日志
 

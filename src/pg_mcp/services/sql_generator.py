@@ -5,7 +5,7 @@ natural language questions into valid PostgreSQL SQL queries.
 """
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from openai import AsyncOpenAI
 
@@ -19,6 +19,13 @@ if TYPE_CHECKING:
     from pg_mcp.models.schema import DatabaseSchema
 
 
+class SQLGenerationResult(NamedTuple):
+    """Generated SQL together with the API-reported token usage."""
+
+    sql: str
+    tokens_used: int
+
+
 class SQLGenerator:
     """SQL generator using OpenAI for natural language to SQL conversion.
 
@@ -29,10 +36,12 @@ class SQLGenerator:
     Example:
         >>> config = OpenAIConfig(api_key="sk-...", model="gpt-4")
         >>> generator = SQLGenerator(config)
-        >>> sql = await generator.generate(
+        >>> result = await generator.generate(
         ...     question="How many users registered today?",
         ...     schema=db_schema
         ... )
+        >>> result.sql
+        'SELECT COUNT(*) FROM users;'
     """
 
     def __init__(self, config: OpenAIConfig) -> None:
@@ -51,7 +60,7 @@ class SQLGenerator:
         context: str | None = None,
         previous_attempt: str | None = None,
         error_feedback: str | None = None,
-    ) -> str:
+    ) -> SQLGenerationResult:
         """Generate SQL statement from natural language question.
 
         This method sends the question and database schema to OpenAI's API
@@ -66,7 +75,7 @@ class SQLGenerator:
             error_feedback: Error message from previous attempt (for retry).
 
         Returns:
-            str: Generated SQL query (without trailing semicolon).
+            SQLGenerationResult: Generated SQL and total API tokens consumed.
 
         Raises:
             LLMError: If generation fails or response is invalid.
@@ -75,12 +84,12 @@ class SQLGenerator:
 
         Example:
             >>> # Initial generation
-            >>> sql = await generator.generate(
+            >>> result = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema
             ... )
             >>> # Retry with error feedback
-            >>> sql = await generator.generate(
+            >>> result = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema,
             ...     previous_attempt="SELECT COUNT(*) FROM user",
@@ -149,7 +158,11 @@ class SQLGenerator:
                 details={"content": content},
             )
 
-        return sql
+        usage = response.usage
+        total_tokens = usage.total_tokens if usage is not None else None
+        tokens_used = total_tokens if isinstance(total_tokens, int) and total_tokens >= 0 else 0
+
+        return SQLGenerationResult(sql=sql, tokens_used=tokens_used)
 
     def _extract_sql(self, content: str) -> str | None:
         """Extract SQL query from LLM response content.
